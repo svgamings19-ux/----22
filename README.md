@@ -1,18 +1,6 @@
 # Учёт личных трат
 
-Учебное веб-приложение на Go: список личных расходов и форма добавления. Выполнены этапы 1 и 2. Сторонних библиотек и базы данных нет; после перезапуска список очищается.
-
-## Запуск в РЕД ОС
-
-Нужен Go 1.22 или новее. Проверьте `go version`. При необходимости установите пакет `golang` через менеджер пакетов вашей версии РЕД ОС либо Go с https://go.dev/dl/.
-
-```bash
-git clone https://github.com/svgamings19-ux/----22.git
-cd -- ----22
-go run .
-```
-
-Откройте http://localhost:8080. Остановка — Ctrl+C. Альтернативный запуск из корня: `go run ./cmd/expenses`. Если порт 8080 занят, остановите предыдущий экземпляр сервера.
+Откройте http://localhost:8080. Остановка — Ctrl+C.
 
 ## Этапы и структура
 
@@ -38,17 +26,6 @@ go run .
 | GET | `/ping` | 200 и `pong` |
 | Другой метод | `/ping` | 405 и `Allow: GET` |
 
-## Проверка
-
-```bash
-go test ./...
-go vet ./...
-curl -i http://localhost:8080/ping
-curl -i -X POST http://localhost:8080/ping
-curl -i -d 'amount=350.50&description=Lunch&date=2026-09-28' http://localhost:8080/expenses/new
-```
-
-После последней команды ожидаются `303 See Other` и `Location: /expenses`. Откройте список, обновите страницу: запись остаётся единственной. Остановите и снова запустите сервер: список пуст. При наличии C-компилятора также можно запустить `go test -race ./...`.
 
 ## Скриншот этапа 2
 
@@ -56,4 +33,4 @@ curl -i -d 'amount=350.50&description=Lunch&date=2026-09-28' http://localhost:80
 
 ![Список трат](docs/screenshots/stage2-list.png)
 
-Отчёты: [этап 1](docs/stage1.md), [этап 2](docs/stage2.md). Результаты выполненных проверок: [docs/verification.md](docs/verification.md).
+Отчёты: [этап 1](docs/stage1.md), [этап 2](docs/stage2.md). 
