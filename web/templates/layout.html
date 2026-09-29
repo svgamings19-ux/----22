@@ -1,0 +1,6 @@
+{{define "layout"}}<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}} · Учёт трат</title><link rel="stylesheet" href="/static/style.css"></head>
+<body><header><div class="bar"><a class="brand" href="/">Учёт трат<span>Личные финансы</span></a><nav aria-label="Главное меню"><a href="/expenses">Мои траты</a><a href="/expenses/new">Добавить трату</a><a href="/about">О проекте</a></nav></div></header>
+<main>{{template "content" .}}</main>
+<footer>Учебный проект на Go · Этап 2<br>Данные хранятся в памяти и удаляются при перезапуске сервера.</footer></body></html>{{end}}

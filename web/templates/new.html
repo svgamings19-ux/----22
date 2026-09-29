@@ -1,0 +1,6 @@
+{{define "content"}}<p class="eyebrow">НОВАЯ ЗАПИСЬ</p><h1>Добавить трату</h1><p class="muted">Запишите расход, чтобы он появился в общем списке.</p>
+<section class="card form-card">{{if .Error}}<div class="error" role="alert">{{.Error}}</div>{{end}}
+<form method="POST" action="/expenses/new"><label for="amount">Сумма, ₽</label><input id="amount" name="amount" type="number" min="0.01" max="999999999.99" step="0.01" placeholder="350.00" value="{{.Amount}}" required>
+<label for="description">Описание</label><input id="description" name="description" maxlength="200" placeholder="Например, продукты" value="{{.Description}}" required>
+<label for="date">Дата</label><input id="date" name="date" type="date" value="{{.Date}}" required>
+<div class="actions"><button type="submit">Сохранить трату</button><a href="/expenses">Отмена</a></div></form></section>{{end}}

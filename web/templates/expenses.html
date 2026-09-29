@@ -1,0 +1,4 @@
+{{define "content"}}<div class="heading"><div><p class="eyebrow">ПОВСЕДНЕВНЫЕ РАСХОДЫ</p><h1>Мои траты</h1><p class="muted">Все ваши записи в одном месте.</p></div><a class="button" href="/expenses/new">+ Добавить трату</a></div>
+<section class="card" aria-label="Список трат"><div class="card-title"><h2>История расходов</h2><span class="badge">Записей: {{len .Expenses}}</span></div>
+{{if .Expenses}}<div class="table-wrap"><table><thead><tr><th scope="col">Дата</th><th scope="col">Описание</th><th scope="col" class="number">Сумма</th></tr></thead><tbody>{{range .Expenses}}<tr><td class="date">{{date .Date}}</td><td>{{.Description}}</td><td class="number">{{money .Amount}} ₽</td></tr>{{end}}</tbody></table></div>
+{{else}}<div class="empty"><h3>Пока нет трат</h3><p>Добавьте первую запись: сумму, описание и дату.</p><a href="/expenses/new">Добавить первую трату →</a></div>{{end}}</section>{{end}}
