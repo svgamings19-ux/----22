@@ -2,6 +2,9 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/csv"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"html/template"
 	"io/fs"
@@ -9,179 +12,389 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
+	"github.com/svgamings19-ux/----22/expenses/internal/config"
 	"github.com/svgamings19-ux/----22/expenses/internal/models"
+	"github.com/svgamings19-ux/----22/expenses/internal/repository"
 	"github.com/svgamings19-ux/----22/expenses/web"
 )
 
 type Handler struct {
-	mu       sync.RWMutex
-	expenses []models.Expense
-	pages    map[string]*template.Template
+	repo      *repository.ExpenseRepository
+	cfg       config.Config
+	logger    *log.Logger
+	pages     map[string]*template.Template
+	limiter   *loginLimiter
+	dummyHash []byte
 }
-
 type pageData struct {
 	Title       string
-	Expenses    []models.Expense
+	Notice      string
+	User        models.User
+	CSRF        string
 	Error       string
+	Errors      map[string]string
+	Expenses    []models.Expense
+	Categories  []models.Category
+	Expense     models.Expense
+	Filter      models.Filter
 	Amount      string
 	Description string
 	Date        string
+	CategoryID  int64
+	Email       string
+	Mode        string
+	Action      string
+	Total       int64
+	Year        int
+	Query       string
+	Status      int
 }
 
-func New() (http.Handler, error) {
-	h := &Handler{pages: make(map[string]*template.Template)}
-	for _, page := range []string{"expenses", "new", "about"} {
-		t, err := template.New("layout").Funcs(template.FuncMap{
-			"money": func(n int64) string { return fmt.Sprintf("%d,%02d", n/100, n%100) },
-			"date":  func(t time.Time) string { return t.Format("02.01.2006") },
-		}).ParseFS(web.Assets, "templates/layout.html", "templates/"+page+".html")
+func money(n int64) string { return fmt.Sprintf("%d,%02d", n/100, n%100) }
+func New(repo *repository.ExpenseRepository, cfg config.Config, logger *log.Logger) (http.Handler, error) {
+	h := &Handler{repo: repo, cfg: cfg, logger: logger, pages: make(map[string]*template.Template), limiter: newLoginLimiter()}
+	if err := h.prepareAuth(); err != nil {
+		return nil, err
+	}
+	for _, name := range []string{"expenses", "expense", "delete", "auth", "stats", "about", "404", "500", "error"} {
+		t, err := template.New("layout").Funcs(template.FuncMap{"money": money, "date": func(s string) string {
+			t, err := time.Parse("2006-01-02", s)
+			if err != nil {
+				return s
+			}
+			return t.Format("02.01.2006")
+		}}).ParseFS(web.Assets, "templates/layout.html", "templates/"+name+".html")
 		if err != nil {
 			return nil, err
 		}
-		h.pages[page] = t
+		h.pages[name] = t
 	}
 	static, err := fs.Sub(web.Assets, "static")
 	if err != nil {
 		return nil, err
 	}
 	mux := http.NewServeMux()
-	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
-	mux.HandleFunc("/", h.home)
-	mux.HandleFunc("/expenses", h.list)
-	mux.HandleFunc("/expenses/new", h.newExpense)
-	mux.HandleFunc("/about", h.about)
+	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(static))))
+	mux.HandleFunc("GET /about", func(w http.ResponseWriter, r *http.Request) {
+		h.render(w, r, "about", 200, pageData{Title: "О приложении"})
+	})
 	mux.HandleFunc("/ping", func(w http.ResponseWriter, r *http.Request) {
-		if !allow(w, r, http.MethodGet) {
+		if r.Method != "GET" {
+			w.Header().Set("Allow", "GET")
+			h.fail(w, r, 405, "Метод не поддерживается.")
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		fmt.Fprintln(w, "pong")
 	})
-	return mux, nil
+	mux.HandleFunc("GET /register", h.authForm)
+	mux.HandleFunc("POST /register", h.register)
+	mux.HandleFunc("GET /login", h.authForm)
+	mux.HandleFunc("POST /login", h.login)
+	mux.Handle("POST /logout", h.requireAuth(http.HandlerFunc(h.logout)))
+	mux.Handle("GET /{$}", h.requireAuth(http.HandlerFunc(h.list)))
+	mux.Handle("GET /expenses", h.requireAuth(http.HandlerFunc(h.list)))
+	mux.Handle("GET /expenses/new", h.requireAuth(http.HandlerFunc(h.expenseForm)))
+	mux.Handle("POST /expenses/new", h.requireAuth(http.HandlerFunc(h.saveExpense)))
+	mux.Handle("GET /expenses/{id}/edit", h.requireAuth(http.HandlerFunc(h.expenseForm)))
+	mux.Handle("POST /expenses/{id}/edit", h.requireAuth(http.HandlerFunc(h.saveExpense)))
+	mux.Handle("GET /expenses/{id}/delete", h.requireAuth(http.HandlerFunc(h.deleteForm)))
+	mux.Handle("POST /expenses/{id}/delete", h.requireAuth(http.HandlerFunc(h.deleteExpense)))
+	mux.Handle("GET /stats", h.requireAuth(http.HandlerFunc(h.statsPage)))
+	mux.Handle("GET /api/stats/by-category", h.requireAuth(http.HandlerFunc(h.byCategory)))
+	mux.Handle("GET /api/stats/by-month", h.requireAuth(http.HandlerFunc(h.byMonth)))
+	mux.Handle("GET /expenses/export", h.requireAuth(http.HandlerFunc(h.export)))
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) { h.fail(w, r, 404, "") })
+	return h.logging(h.recoverer(h.security(h.session(h.csrf(mux))))), nil
 }
 
-func allow(w http.ResponseWriter, r *http.Request, methods ...string) bool {
-	for _, method := range methods {
-		if r.Method == method {
-			return true
-		}
-	}
-	w.Header().Set("Allow", strings.Join(methods, ", "))
-	http.Error(w, "Метод не поддерживается", http.StatusMethodNotAllowed)
-	return false
-}
-
-func (h *Handler) render(w http.ResponseWriter, name string, status int, data pageData) {
-	var buf bytes.Buffer
-	if err := h.pages[name].ExecuteTemplate(&buf, "layout", data); err != nil {
-		log.Printf("render %s: %v", name, err)
-		http.Error(w, "Ошибка отображения страницы", http.StatusInternalServerError)
+func (h *Handler) render(w http.ResponseWriter, r *http.Request, name string, status int, d pageData) {
+	d.User = currentUser(r)
+	d.CSRF = csrfValue(r)
+	var b bytes.Buffer
+	if err := h.pages[name].ExecuteTemplate(&b, "layout", d); err != nil {
+		h.logger.Printf("template %s: %v", name, err)
+		http.Error(w, "Ошибка отображения страницы", 500)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(status)
-	_, _ = w.Write(buf.Bytes())
+	_, _ = w.Write(b.Bytes())
 }
-
-func (h *Handler) home(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
-		http.NotFound(w, r)
+func (h *Handler) fail(w http.ResponseWriter, r *http.Request, status int, message string) {
+	if message == "" {
+		switch status {
+		case 404:
+			message = "Страница или запись не найдена."
+		case 500:
+			message = "Не удалось выполнить запрос. Попробуйте позже."
+		default:
+			message = http.StatusText(status)
+		}
+	}
+	if strings.HasPrefix(r.URL.Path, "/api/") {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(status)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 		return
 	}
-	h.list(w, r)
+	page := "error"
+	if status == 404 {
+		page = "404"
+	}
+	if status == 500 {
+		page = "500"
+	}
+	h.render(w, r, page, status, pageData{Title: fmt.Sprintf("Ошибка %d", status), Error: message, Status: status})
 }
-
+func (h *Handler) dbError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, repository.ErrNotFound) {
+		h.fail(w, r, 404, "")
+		return
+	}
+	h.logger.Printf("request failed: %v", err)
+	h.fail(w, r, 500, "")
+}
+func (h *Handler) categories(w http.ResponseWriter, r *http.Request) ([]models.Category, bool) {
+	cats, err := h.repo.Categories(r.Context())
+	if err != nil {
+		h.dbError(w, r, err)
+		return nil, false
+	}
+	return cats, true
+}
+func hasCategory(cats []models.Category, id int64) bool {
+	for _, c := range cats {
+		if c.ID == id {
+			return true
+		}
+	}
+	return false
+}
 func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
-	if !allow(w, r, http.MethodGet) {
+	cats, ok := h.categories(w, r)
+	if !ok {
 		return
 	}
-	h.mu.RLock()
-	items := append([]models.Expense(nil), h.expenses...)
-	h.mu.RUnlock()
-	h.render(w, "expenses", http.StatusOK, pageData{Title: "Мои траты", Expenses: items})
+	f, err := parseFilter(r.URL.Query())
+	if err == nil && f.CategoryID != 0 && !hasCategory(cats, f.CategoryID) {
+		err = errors.New("Категория не найдена.")
+	}
+	d := pageData{Title: "Мои траты", Categories: cats, Filter: f, Query: r.URL.Query().Encode()}
+	if err != nil {
+		d.Error = err.Error()
+		h.render(w, r, "expenses", 400, d)
+		return
+	}
+	d.Expenses, err = h.repo.GetAll(r.Context(), currentUser(r).ID, f)
+	if err != nil {
+		h.dbError(w, r, err)
+		return
+	}
+	for _, e := range d.Expenses {
+		d.Total += e.Amount
+	}
+	h.render(w, r, "expenses", 200, d)
 }
-
-func (h *Handler) about(w http.ResponseWriter, r *http.Request) {
-	if !allow(w, r, http.MethodGet) {
-		return
+func (h *Handler) findExpense(w http.ResponseWriter, r *http.Request) (models.Expense, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil || id <= 0 {
+		h.fail(w, r, 404, "")
+		return models.Expense{}, false
 	}
-	h.render(w, "about", http.StatusOK, pageData{Title: "О проекте"})
+	e, err := h.repo.GetByID(r.Context(), currentUser(r).ID, id)
+	if err != nil {
+		h.dbError(w, r, err)
+		return e, false
+	}
+	return e, true
 }
-
-func parseAmount(raw string) (int64, error) {
-	parts := strings.Split(strings.ReplaceAll(strings.TrimSpace(raw), ",", "."), ".")
-	if len(parts) > 2 || parts[0] == "" {
-		return 0, fmt.Errorf("Укажите положительную сумму с точностью до копеек.")
+func (h *Handler) expenseForm(w http.ResponseWriter, r *http.Request) {
+	cats, ok := h.categories(w, r)
+	if !ok {
+		return
 	}
-	for _, part := range parts {
-		if part == "" {
-			return 0, fmt.Errorf("Неверный формат суммы.")
+	d := pageData{Title: "Новая трата", Date: time.Now().Format("2006-01-02"), Categories: cats, Action: "/expenses/new"}
+	if r.PathValue("id") != "" {
+		e, ok := h.findExpense(w, r)
+		if !ok {
+			return
 		}
-		for _, c := range part {
-			if c < '0' || c > '9' {
-				return 0, fmt.Errorf("Сумма должна быть числом.")
-			}
-		}
+		d.Title = "Редактировать трату"
+		d.Expense = e
+		d.Amount = money(e.Amount)
+		d.Description = e.Description
+		d.Date = e.Date
+		d.CategoryID = e.CategoryID
+		d.Action = r.URL.Path
 	}
-	whole, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || whole > 999999999 {
-		return 0, fmt.Errorf("Сумма слишком велика (максимум 999999999,99).")
-	}
-	var fraction int64
-	if len(parts) == 2 {
-		if len(parts[1]) > 2 {
-			return 0, fmt.Errorf("Допускается не больше двух знаков после запятой.")
-		}
-		fraction, _ = strconv.ParseInt(parts[1], 10, 64)
-		if len(parts[1]) == 1 {
-			fraction *= 10
-		}
-	}
-	amount := whole*100 + fraction
-	if amount <= 0 {
-		return 0, fmt.Errorf("Сумма должна быть больше нуля.")
-	}
-	return amount, nil
+	h.render(w, r, "expense", 200, d)
 }
-
-func (h *Handler) newExpense(w http.ResponseWriter, r *http.Request) {
-	if !allow(w, r, http.MethodGet, http.MethodPost) {
+func (h *Handler) saveExpense(w http.ResponseWriter, r *http.Request) {
+	var id int64
+	if r.PathValue("id") != "" {
+		e, ok := h.findExpense(w, r)
+		if !ok {
+			return
+		}
+		id = e.ID
+	}
+	cats, ok := h.categories(w, r)
+	if !ok {
 		return
 	}
-	data := pageData{Title: "Добавить трату", Date: time.Now().Format("2006-01-02")}
-	if r.Method == http.MethodGet {
-		h.render(w, "new", http.StatusOK, data)
+	d := pageData{Title: "Новая трата", Categories: cats, Action: r.URL.Path, Amount: strings.TrimSpace(r.PostFormValue("amount")), Description: strings.TrimSpace(r.PostFormValue("description")), Date: r.PostFormValue("date"), Errors: map[string]string{}}
+	if id != 0 {
+		d.Title = "Редактировать трату"
+	}
+	amount, err := parseAmount(d.Amount)
+	if err != nil {
+		d.Errors["amount"] = err.Error()
+	}
+	if !utf8.ValidString(d.Description) || utf8.RuneCountInString(d.Description) < 1 || utf8.RuneCountInString(d.Description) > 200 {
+		d.Errors["description"] = "Введите описание от 1 до 200 символов."
+	}
+	if !validDate(d.Date) {
+		d.Errors["date"] = "Укажите существующую дату в формате ГГГГ-ММ-ДД."
+	}
+	d.CategoryID, err = strconv.ParseInt(r.PostFormValue("category_id"), 10, 64)
+	if err != nil || !hasCategory(cats, d.CategoryID) {
+		d.Errors["category"] = "Выберите категорию из списка."
+	}
+	if len(d.Errors) > 0 {
+		d.Error = "Проверьте отмеченные поля."
+		h.render(w, r, "expense", 400, d)
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, 16*1024)
-	if err := r.ParseForm(); err != nil {
-		http.Error(w, "Не удалось прочитать форму", http.StatusBadRequest)
+	e := models.Expense{Amount: amount, Description: d.Description, Date: d.Date, CategoryID: d.CategoryID}
+	if id == 0 {
+		_, err = h.repo.Create(r.Context(), currentUser(r).ID, e)
+	} else {
+		err = h.repo.Update(r.Context(), currentUser(r).ID, id, e)
+	}
+	if err != nil {
+		h.dbError(w, r, err)
 		return
 	}
-	data.Amount = strings.TrimSpace(r.PostFormValue("amount"))
-	data.Description = strings.TrimSpace(r.PostFormValue("description"))
-	data.Date = strings.TrimSpace(r.PostFormValue("date"))
-	amount, err := parseAmount(data.Amount)
-	date, dateErr := time.Parse("2006-01-02", data.Date)
-	switch {
-	case err != nil:
-		data.Error = err.Error()
-	case data.Description == "" || utf8.RuneCountInString(data.Description) > 200:
-		data.Error = "Введите описание от 1 до 200 символов."
-	case dateErr != nil || date.Year() < 1:
-		data.Error = "Укажите существующую дату в формате ГГГГ-ММ-ДД."
-	}
-	if data.Error != "" {
-		h.render(w, "new", http.StatusBadRequest, data)
-		return
-	}
-	h.mu.Lock()
-	h.expenses = append(h.expenses, models.Expense{Amount: amount, Description: data.Description, Date: date})
-	h.mu.Unlock()
-	// Post/Redirect/Get: обновление страницы повторяет GET, а не POST.
 	http.Redirect(w, r, "/expenses", http.StatusSeeOther)
+}
+func (h *Handler) deleteForm(w http.ResponseWriter, r *http.Request) {
+	e, ok := h.findExpense(w, r)
+	if !ok {
+		return
+	}
+	h.render(w, r, "delete", 200, pageData{Title: "Удалить трату", Expense: e, Action: r.URL.Path})
+}
+func (h *Handler) deleteExpense(w http.ResponseWriter, r *http.Request) {
+	e, ok := h.findExpense(w, r)
+	if !ok {
+		return
+	}
+	if err := h.repo.Delete(r.Context(), currentUser(r).ID, e.ID); err != nil {
+		h.dbError(w, r, err)
+		return
+	}
+	http.Redirect(w, r, "/expenses", 303)
+}
+func (h *Handler) statsPage(w http.ResponseWriter, r *http.Request) {
+	h.render(w, r, "stats", 200, pageData{Title: "Статистика", Year: time.Now().Year()})
+}
+func (h *Handler) byCategory(w http.ResponseWriter, r *http.Request) {
+	f, err := parseFilter(r.URL.Query())
+	if err != nil {
+		h.fail(w, r, 400, err.Error())
+		return
+	}
+	if f.CategoryID != 0 {
+		cats, ok := h.categories(w, r)
+		if !ok {
+			return
+		}
+		if !hasCategory(cats, f.CategoryID) {
+			h.fail(w, r, 400, "Категория не найдена.")
+			return
+		}
+	}
+	data, err := h.repo.ByCategory(r.Context(), currentUser(r).ID, f)
+	if err != nil {
+		h.dbError(w, r, err)
+		return
+	}
+	h.json(w, data)
+}
+func (h *Handler) byMonth(w http.ResponseWriter, r *http.Request) {
+	year := time.Now().Year()
+	if v := r.URL.Query().Get("year"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 || n > 9999 {
+			h.fail(w, r, 400, "Год должен быть от 1 до 9999.")
+			return
+		}
+		year = n
+	}
+	data, err := h.repo.ByMonth(r.Context(), currentUser(r).ID, year)
+	if err != nil {
+		h.dbError(w, r, err)
+		return
+	}
+	h.json(w, data)
+}
+func (h *Handler) json(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	_ = json.NewEncoder(w).Encode(v)
+}
+
+// Prevent spreadsheet software from interpreting user text as a formula.
+func csvText(s string) string {
+	trimmed := strings.TrimLeftFunc(s, unicode.IsSpace)
+	if trimmed != "" && strings.ContainsRune("=+-@", rune(trimmed[0])) {
+		return "'" + s
+	}
+	if strings.ContainsAny(s, "\t\r\n") {
+		return "'" + s
+	}
+	return s
+}
+func (h *Handler) export(w http.ResponseWriter, r *http.Request) {
+	f, err := parseFilter(r.URL.Query())
+	if err != nil {
+		h.fail(w, r, 400, err.Error())
+		return
+	}
+	if f.CategoryID != 0 {
+		cats, ok := h.categories(w, r)
+		if !ok {
+			return
+		}
+		if !hasCategory(cats, f.CategoryID) {
+			h.fail(w, r, 400, "Категория не найдена.")
+			return
+		}
+	}
+	items, err := h.repo.GetAll(r.Context(), currentUser(r).ID, f)
+	if err != nil {
+		h.dbError(w, r, err)
+		return
+	}
+	var b bytes.Buffer
+	b.WriteString("\ufeff")
+	cw := csv.NewWriter(&b)
+	cw.Comma = ';'
+	cw.UseCRLF = true
+	_ = cw.Write([]string{"Дата", "Категория", "Описание", "Сумма (RUB)"})
+	for _, e := range items {
+		_ = cw.Write([]string{e.Date, csvText(e.Category), csvText(e.Description), money(e.Amount)})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		h.dbError(w, r, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="expenses-`+time.Now().Format("2006-01-02")+`.csv"`)
+	_, _ = w.Write(b.Bytes())
 }

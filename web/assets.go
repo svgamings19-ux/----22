@@ -2,7 +2,5 @@ package web
 
 import "embed"
 
-// Assets встраивает HTML и CSS в программу, чтобы запуск не зависел от рабочей папки.
-//
-//go:embed templates/*.html static/*.css
+//go:embed templates/*.html static/*
 var Assets embed.FS

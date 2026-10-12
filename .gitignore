@@ -1,4 +1,8 @@
-/bin/
+.env
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 *.exe
-*.test
 coverage.out
+/expenses
